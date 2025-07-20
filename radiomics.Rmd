@@ -1,0 +1,1205 @@
+---
+title: "BC-202 Final Project"
+author: "Georgios Kousis Tsampazis"
+date: "`r Sys.Date()`"
+output: 
+  rmdformats::readthedown:
+    self_contained: true
+    thumbnails: false
+    lightbox: false
+    gallery: false
+    highlight: "tango"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Analysis of Radiomics Data from Vascular Thrombi
+
+A comprehensive exploration of radiomic data derived from vascular thrombi, employing both unsupervised and supervised machine‑learning techniques. This notebook demonstrates R programming workflows, covering data preprocessing, feature extraction, clustering, and predictive modeling to uncover meaningful patterns and build robust classifiers.
+
+---
+
+## **Part 1:** Downloads
+
+* Download dependencies
+* Download raw data
+
+## **Part 2:** Preprocessing
+
+* Load the `.xlsx` file into a DataFrame
+* Enforce correct data types
+
+## **Part 3:** Data Normalization
+
+* Normalize numerical features
+* Scan for missing values
+* Verify Failureings and categories
+
+## **Part 4:** PCA & Clustering
+
+* Perform Principal Component Analysis
+* Run clustering algorithms (e.g. K‑Means, Hierarchical)
+* Visualize clusters in PCA space
+
+## **Part 5:** Correlation Analysis
+
+* Compute feature correlation matrix
+* Plot heatmap of correlations
+
+## **Part 6:** Train/Test Split
+
+* Define features (X) and target (y)
+* Split data into training and testing sets
+
+## **Part 7:** Feature Selection
+
+* Apply the Boruta algorithm for selecting important features
+
+## **Part 8:** Feature Selection Plots
+
+* Generate barplots or boxplots of top features
+* Visualize feature importance distributions
+
+## **Part 9:** XGBoost Modeling
+
+* Train an XGBoost classifier/regressor
+* Tune hyperparameters (e.g. via grid search)
+
+## **Part 10:** Performance Evaluation
+
+* Compute accuracy
+* Plot confusion matrix
+* Plot ROC curve (for classification)
+
+---
+
+# **Part 1**: Downloads
+
+This setup chunk begins by listing all required packages for our analysis, including both CRAN and the Bioconductor-only `ggtree`. It then checks for any missing CRAN packages and installs them automatically. Finally, it attempts to load each package and stops with an error message if any fail to load.
+
+```{r Download_Dependencies}
+# List all required packages
+required_pkgs <- c(
+  "readxl", "dplyr", "caTools", "ggplot2", "factoextra", "amap",
+  "corrplot", "Boruta", "xgboost", "mlr", "parallel", "parallelMap",
+  "caret", "pROC", "tidyr", "ggpubr", "ggtree","mclust","patchwork","cluster","factoextra","mclust","DT","janitor","ape"
+)
+
+# Separate CRAN and Bioconductor packages
+cran_pkgs = setdiff(required_pkgs, "ggtree")
+
+# Find which CRAN packages are not yet installed
+new_cran = cran_pkgs[!(cran_pkgs %in% installed.packages()[, "Package"])]
+if (length(new_cran)) {
+  install.packages(new_cran, dependencies = TRUE)
+}
+
+# Special install for ggtree (Bioconductor)
+if (!requireNamespace("ggtree", quietly = TRUE)) {
+  if (!requireNamespace("BiocManager", quietly = TRUE))
+    install.packages("BiocManager")
+  BiocManager::install("ggtree", update = FALSE, ask = FALSE)
+}
+
+# Load all packages (and throw an error if one fails to load)
+for (pkg in required_pkgs) {
+  success = suppressMessages(require(pkg, character.only = TRUE))
+  if (!success) {
+    stop(paste("Failed to load package:", pkg))
+  }
+}
+
+```
+
+This chunk creates a `.data_tmp_gkt` folder if needed, downloads `Final_exam_data.xlsx` from GitHub into it.
+
+```{r Download Data}
+# Define the directory and file paths
+dir_name = ".data_tmp_gkt"
+file_name = "Final_exam_data.xlsx"
+file_url = "https://github.com/geokousis/Intro-Python/raw/refs/heads/main/Final_exam_data.xlsx"
+file_path = file.path(dir_name, file_name)
+
+# Create the directory if it doesn't exist
+if (!dir.exists(dir_name)) {
+  dir.create(dir_name)
+}
+
+# Download the file
+download.file(url = file_url, destfile = file_path, mode = "wb")
+
+cat("File downloaded to:", file_path, "\n")
+```
+---
+
+# **Part 2**: Preprocessing
+
+This chunk reads the Excel file into a data frame (using 1,000 rows to guess column types), then converts `PatientID` to text.
+```{r Open xlsx file}
+# Define the directory and file paths
+df <- read_excel(file_path, guess_max = 1000)
+df$PatientID <- as.character(df$PatientID)
+```
+
+```{r DT-xlsx, message=FALSE}
+datatable(
+  df[1:20,],
+  options = list(
+    pageLength = 10,
+    autoWidth   = TRUE,
+    scrollX     = TRUE
+  ),
+  filter = 'top',
+  rownames = FALSE
+)
+```
+
+```{r Check Data type}
+non_numeric_cols = names(df)[!sapply(df, is.numeric)]
+non_numeric_cols
+```
+All columns are numeric except PatientID, as intended 
+
+```{r Check for NA}
+colSums(is.na(df))[colSums(is.na(df)) > 0]
+```
+Five samples lack a **Failure** label, so we’ll exclude them from any supervised‑learning models. However, unsupervised techniques can still include these unlabeled cases to discover natural clusters and even suggest labels for them (cluster assignment).
+
+```{r Labels Check}
+unique(unclass(df$Failure))
+```
+**Failure** has 3 different Values 0 indicating False (so Success), 1 indicating True (Fail) and NA (Missing). 
+
+```{r Labels Count}
+table(df$Failure)
+```
+Also we can see that are categories are not balanced, with Failure set as 0 (Success) dominating.
+
+---
+
+# **Part 3**: Data Normalisation/Preprocessing
+
+This chunk standardizes every numeric column (except `PatientID` and `Failure`) by centering on the mean and scaling by the standard deviation.
+```{r Normalization}
+numerical_data = setdiff(names(df), c("PatientID", "Failure"))
+df_scaled = df  
+for (col in numerical_data) {
+  x = df[[col]]
+  df_scaled[[col]] = (x - mean(x)) / sd(x)
+}
+```
+
+```{r DT-scaled, message=FALSE}
+datatable(
+  df_scaled[1:20, ],
+  options = list(
+    pageLength = 10,
+    autoWidth   = TRUE,
+    scrollX     = TRUE
+  ),
+  filter = 'top',
+  rownames = FALSE
+)
+```
+---
+
+#  **Part 4**: PCA & Clustering
+
+This chunk performs PCA on the normalized numeric features, captures the percentage of variance explained by the first three components, converts `Failure` into a factor (including “Missing”), and then plots the PC1–PC2.
+
+## PCA
+```{r PCA,fig.width=14, fig.height=8}
+
+# Recode factors to help with plotting clarity, could add factor before but wasn't necessary
+df_scaled$Outcome = with(df_scaled,
+  factor(
+    ifelse(
+      is.na(Failure),"Missing",ifelse(Failure == 1, "Failure", "Success")
+    ),
+    levels = c("Success", "Failure", "Missing") #  I guess 0 means False Failure so Success and 1 means True failure so Failure 
+  )
+)
+
+# PCA
+pca_res = prcomp(
+  df_scaled[, numerical_data],
+  center = FALSE,
+  scale.  = FALSE
+)
+
+# PCA labels
+vars = summary(pca_res)$importance[2, 1:2] * 100
+pc1_lbl = sprintf("PC1 (%.2f%%)", vars[1])
+pc2_lbl = sprintf("PC2 (%.2f%%)", vars[2])
+
+# PCA df and Plotting
+pca_scores = pca_res$x[, 1:2]
+pca_df = cbind(
+  as.data.frame(pca_scores),
+  Outcome = df_scaled$Outcome,
+  Label = rownames(df_scaled)
+)
+names(pca_df)[1:2] = c("PC1","PC2")
+
+ggplot(pca_df, aes(x = PC1, y = PC2, colour = Outcome)) +
+  geom_point(size = 6, alpha = 0.6) +
+  theme_bw() +
+  theme(
+    plot.title      = element_text(face = "bold", size = 14),
+    axis.title      = element_text(face = "bold", size = 12),
+    legend.title    = element_text(face = "bold"),
+    legend.position = "right"
+  ) +
+  labs(
+    x      = pc1_lbl,
+    y      = pc2_lbl,
+    colour = "Outcome",
+    title  = "PCA of Radiomic Features from Vascular Thrombi"
+  ) +
+  scale_color_manual(values = c(
+    "Success" = "forestgreen",
+    "Failure" = "firebrick2",
+    "Missing" = "gray50"
+  ))
+
+```
+
+**Figure 1. Principal Component Analysis (PCA) of Radiomic Features from Vascular Thrombi.** *PCA was performed on scaled radiomic features extracted from vascular thrombi. The scatter plot displays individual patients projected onto the first two principal components (PC1 and PC2), which together explain 64.08% of the total variance (PC1: 50.62%, PC2: 13.46%). Each point represents a patient and is colored according to thrombus failure status: green for Failure = False, so Success, red for Failure = True, and gray for patients with missing failure data. Although PC1 and PC2 capture the majority of variance in the dataset, there is considerable overlap between the success and failure groups, suggesting that these components alone do not inherently separate the two outcomes.*
+
+## Clustering
+
+This chunk computes hierarchical clustering on the scaled features using Manhattan distance and complete method. It evaluates cluster quality with a silhouette plot and creates a PCA scatterplot showing samples colored by failure status and shaped by cluster (with ellipses around each group). Finally, it builds a circular dendrogram annotated by failure and cluster membership and displays the PCA plot alongside the dendrogram.
+
+```{r Clustering, fig.width=14, fig.height=8, message=FALSE, warning=FALSE, results='hide'}
+# Hierarchical clustering (Manhattan + complete) 
+manhattan_dist = dist(df_scaled[, numerical_data], method = "manhattan")
+hc = hclust(manhattan_dist, method = "complete")
+clusters = cutree(hc, k = 2)  # We have two categories so we expect to clusters 
+
+# Silhouette analysis & plot 
+sil = silhouette(clusters, manhattan_dist)
+p_sil = fviz_silhouette(sil, print.summary = TRUE) +
+  ggtitle("Silhouette Plot for k = 2 (Manhattan + Complete)") +
+  theme(
+    plot.title = element_text(hjust = 0.5, face = "bold")
+  )
+
+# PCA with clusters 
+pca_df = data.frame(
+  PC1     = pca_scores[,1],
+  PC2     = pca_scores[,2],
+  Outcome = df_scaled$Outcome,
+  Cluster = factor(clusters),
+  Label   = rownames(df_scaled)
+)
+
+# PCA plot decorated by Failure & Cluster 
+p_pca = ggplot(pca_df, aes(x = PC1, y = PC2)) +
+  geom_point(
+    aes(color = Outcome, shape = Cluster),
+    size = 4, alpha = 0.75
+  ) +
+  stat_ellipse(
+    aes(group = Cluster, fill = Cluster),
+    geom = "polygon", alpha = 0.1, color = NA
+  ) +
+  scale_color_manual(values = c(
+    "Success" = "forestgreen",
+    "Failure" = "firebrick2",
+    "Missing" = "gray50"
+  )) +
+  scale_shape_manual(values = c(16, 17)) +
+  labs(
+    title = "PCA with Hierarchical Clustering",
+    x     = pc1_lbl,
+    y     = pc2_lbl,
+    color = "Outcome",
+    shape = "Cluster"
+  ) +
+  theme_minimal(base_size = 14) +
+  theme(
+    plot.title     = element_text(hjust = 0.5, face = "bold"),
+    legend.position= "right"
+  )
+
+# Prepare & plot circular dendrogram 
+phylo_tree = as.phylo(hc)
+tip_df = data.frame(
+  label = phylo_tree$tip.label,
+  Outcome = df_scaled$Outcome[match(phylo_tree$tip.label, rownames(df_scaled))],
+  Cluster = factor(clusters[match(phylo_tree$tip.label, rownames(df_scaled))])
+)
+
+p_dendro=ggtree(phylo_tree, layout = "circular") %<+% tip_df +
+  geom_tippoint(aes(color = Outcome, shape = Cluster), size = 2.5) +
+  scale_color_manual(values = c(
+    "Success" = "forestgreen",
+    "Failure" = "firebrick2",
+    "Missing" = "gray50"
+  )) +
+  scale_shape_manual(values = c(16, 17)) +
+  ggtitle("Circular Dendrogram\nColor = Outcome, Shape = Cluster") +
+  theme(
+    plot.title = element_text(hjust = 0.5, face = "bold"),
+    legend.position = "right"
+  )
+
+# Combine & display all three panels 
+combined_plot <-  (p_pca | p_dendro)/ p_sil  +
+  plot_layout(heights = c(2, 1))
+
+print(combined_plot)
+
+```
+**Figure 2. Hierarchical clustering and validation of PCA‑derived radiomic features** *Hierarchical agglomerative clustering (Manhattan distance with Complete’s linkage, was applied to the radiomics data. In the top‑left panel, each patient is plotted in PC1–PC2 space and assigned to cluster 1  (circles) or cluster 2 (triangles), also ellipses are around each cluster(light red for 1, light green for 2). Points are colored by thrombus Failure outcome (green=success, red=failure, gray=missing). The top‑right circular dendrogram shows the two primary branches corresponding to these clusters, with leaf shapes denoting cluster membership and leaf colors indicating Failure outcome. The bottom silhouette plot for k=2 displays silhouette widths for cluster 1 (red) and cluster 2 (teal), with the overall mean silhouette marked by a dashed line. Positive values reflect well‑fitting samples, values near zero lie on cluster boundaries, and negative values flag potential misassignment (ambiguous assignment).*
+
+
+The negative and near‑zero silhouette scores indicate that, many samples fail to form well‑defined clusters, rather, they overlap extensively. In the PCA plot, the cluster‑boundary ellipses overlap, confirming that our data’s natural grouping isn’t spherical and therefore conventional clustering is difficult.
+When we color by the true “Failure” and “Success” labels, the two classes remain heavily interspersed, which shows that unsupervised clustering alone cannot separate them. This reinforces the need for supervised machine‑learning approaches, which can learn non‑linear decision boundaries tailored to our labeled data.
+Finally, the Hierarchical clustering dendrogram places all of the samples with missing labels in “Success" branches. This suggests that those missing cases very likely belong to the "Success" class.
+
+### ARI
+
+This chunk excludes samples with “Missing” failure labels, then computes and prints the Adjusted Rand Index (ARI), an external cluster validation metric, that compares the true failure statuses to the hierarchical clustering assignments.
+
+```{r ARI}
+# Filter out rows with Missing outcomes
+valid_idx=which(df_scaled$Outcome != "Missing")
+
+# Create true & predicted labels 
+true_labels=df_scaled$Outcome[valid_idx]   
+predicted_clusters=clusters[valid_idx]      
+ari=adjustedRandIndex(true_labels, predicted_clusters)
+
+cat("Adjusted Rand Index (excluding Missing):", ari, "\n")
+
+```
+
+The negative Adjusted Rand Index (ARI) confirms that our two‑cluster solution is actually performing worse than random with respect to the true “Success” vs. “Failure” labels. Coupled with the near‑zero and negative silhouette scores we can see that the data do not naturally split into two distinct and true (Success/Failure) categories. In short, unsupervised clustering alone cannot recover the outcome labels, so we’ll need to move to supervised learning approaches. Even then, because the classes are so intermingled, careful model training and tuning, will be essential to achieve reliable predictions.
+
+```{r kmeans, fig.width=14, fig.height=8}
+
+# Hierarchical clustering (Manhattan + complete) 
+manhattan_dist = dist(df_scaled[, numerical_data], method = "manhattan")
+
+set.seed(7) 
+km_fit   <- kmeans(df_scaled[, numerical_data], centers = 2, nstart = 25)
+clusters <- km_fit$cluster
+
+# Silhouette analysis & plot 
+sil = silhouette(clusters, manhattan_dist)
+p_sil = fviz_silhouette(sil, print.summary = TRUE) +
+  ggtitle("Silhouette Plot for k = 2 (Manhattan + K-means)") +
+  theme(
+    plot.title = element_text(hjust = 0.5, face = "bold")
+  )
+
+# PCA with clusters 
+pca_df = data.frame(
+  PC1     = pca_scores[,1],
+  PC2     = pca_scores[,2],
+  Outcome = df_scaled$Outcome,
+  Cluster = factor(clusters),
+  Label   = rownames(df_scaled)
+)
+
+# PCA plot decorated by Failure & Cluster 
+p_pca = ggplot(pca_df, aes(x = PC1, y = PC2)) +
+  geom_point(
+    aes(color = Outcome, shape = Cluster),
+    size = 4, alpha = 0.75
+  ) +
+  stat_ellipse(
+    aes(group = Cluster, fill = Cluster),
+    geom = "polygon", alpha = 0.1, color = NA
+  ) +
+  scale_color_manual(values = c(
+    "Success" = "forestgreen",
+    "Failure" = "firebrick2",
+    "Missing" = "gray50"
+  )) +
+  scale_shape_manual(values = c(16, 17)) +
+  labs(
+    title = "PCA with K-means Clustering",
+    x     = pc1_lbl,
+    y     = pc2_lbl,
+    color = "Outcome",
+    shape = "Cluster"
+  ) +
+  theme_minimal(base_size = 14) +
+  theme(
+    plot.title     = element_text(hjust = 0.5, face = "bold"),
+    legend.position= "right"
+  )
+
+# Combine & display all three panels 
+combined_plot = (p_pca | p_sil)
+
+print(combined_plot)
+```
+**Figure 3.** *K-Means clustering (Manhattan distance) and scoring (Silhouette Scores). In the left panel, each patient is plotted in PC1–PC2 space and assigned to cluster 1  (circles) or cluster 2 (triangles), also ellipses are around each cluster(light red for 1, light green for 2). Points are colored by thrombus Failure outcome (green=success, red=failure, gray=missing).The bottom silhouette plot for k=2 displays silhouette widths for cluster 1 (red) and cluster 2 (teal), with the overall mean silhouette marked by a dashed line.*
+```{r kmeas_ari}
+ # Filter out rows with Missing outcomes
+valid_idx = which(df_scaled$Outcome != "Missing")
+
+# Create true & predicted labels 
+true_labels = df_scaled$Outcome[valid_idx]   
+predicted_clusters=clusters[valid_idx]      
+ari= adjustedRandIndex(true_labels, predicted_clusters)
+
+cat("Adjusted Rand Index (excluding Missing):", ari, "\n")
+```
+
+Even though k‑means(a more complex unsupervised approach) improves silhouette scores above zero and raises the ARI to 0.17, the clusters still do not distinguish “Success” from “Failure.” This confirms that we need to use supervised learning.
+
+---
+
+# **Part 5**: Correlation Analysis
+
+This chunk computes the pairwise Pearson correlation matrix for all normalized features (using pairwise complete observations), then visualizes it as a heatmap organized by hierarchical clustering into three clusters with corrplot.
+
+```{r Correlation Analysis, fig.width=7, fig.height=7}
+cor_matrix = cor(df_scaled[, numerical_data], use = "pairwise.complete.obs", method = "pearson")
+corrplot(cor_matrix, method = "color", type = "full", order = "hclust",
+         addrect = 3, tl.pos = "n")
+
+# Add centered title after plot
+title("Correlation Matrix with Clustering", line = 3, cex.main = 1.2)
+```
+
+**Figure 3. Clustered Pearson Correlation Heatmap of Numerical Features.** *Hierarchical clustering of the Pearson correlation matrix reveals three primary feature groups. The bottom‑right block (Cluster 1) comprises variables with very strong mutual positive correlations (r≈0.8–1.0), indicating substantial redundancy. The top‑left block (Cluster 2) contains features that are similarly intercorrelated but show strong negative relationships (r≈–0.6 to –0.8) with Cluster 1, suggesting they capture an opposing dimension. Cluster 3 (central block) likewise contains tightly linked features (r≈0.7–0.9) that form a separate axis of co‑variation.*
+
+```{r DT-top-correlations, message=FALSE}
+
+# Compute feature clusters and flatten correlation matrix
+dist_corr= as.dist(1 - abs(cor_matrix))
+hc_feats= hclust(dist_corr, method = "complete")
+feat_grp=cutree(hc_feats, k = 3) # Like the plot above
+
+flattenCorrMatrix = function(cmat) {  # We need upper triangle (or llower) format we dont want self hit
+  ut <- upper.tri(cmat)
+  data.frame(
+    Feature1 = rownames(cmat)[row(cmat)[ut]],
+    Feature2 = rownames(cmat)[col(cmat)[ut]],
+    Correlation = cmat[ut]
+  )
+}
+
+corr_df =flattenCorrMatrix(cor_matrix)
+corr_df$Cluster1 = feat_grp[as.character(corr_df$Feature1)]
+corr_df$Cluster2 = feat_grp[as.character(corr_df$Feature2)]
+
+intra = subset(corr_df, Cluster1 == Cluster2)
+
+# 3. Get top pairs per cluster and combine into one data.frame
+top_by_cluster = lapply(sort(unique(intra$Cluster1)), function(cl) {
+  sub = subset(intra, Cluster1 == cl)
+  sub[order(-abs(sub$Correlation)), ][1:20, c("Feature1", "Feature2", "Correlation")]
+})
+names(top_by_cluster) = paste0("Cluster_", sort(unique(intra$Cluster1)))
+
+top_df = do.call(rbind, lapply(seq_along(top_by_cluster), function(i) {
+  df = top_by_cluster[[i]]
+  df$Cluster= names(top_by_cluster)[i]
+  df
+}))
+top_df =top_df[, c("Cluster", "Feature1", "Feature2", "Correlation")]
+
+# 4. Render as an interactive datatable
+datatable(
+  top_df,
+  options = list(
+    pageLength = 10,
+    autoWidth = TRUE,
+    scrollX = TRUE
+  ),
+  filter = 'top',
+  rownames = FALSE
+)
+```
+
+The top correlated features fall into three tight groups: one built around energy measures (e.g. “energy” and “total energy”), another centered on joint‐average statistics (e.g. joint average and sum average), and a third composed of texture descriptors like large‑area emphasis and zone variance. Within each of these clusters, correlations approach unity (r≈1), revealing almost complete redundancy. This strongly suggest the need of feature selection to streamline our modeling pipeline, reducing both training time and model complexity while preserving predictive accuracy.
+
+---
+
+# **Part 6**: Training/Test split
+
+This chunk first selects the `Failure` column, filters out any “Missing” failure entries, and sets a seed for reproducibility. It then uses stratified sampling to split the data into 70% training and 30% testing sets. “Missing” failure entries are filtered cause this training split is going to be utilized for supervised learning so we don't want NA labels. We use a stratified train/test split to ensure both “Success” and “Failure” classes remain proportionally represented, guaranteeing the model sees examples of each outcome, which is crucial given our dataset’s imbalance.We don't use the normalized data since we are going to use  **tree-based** algorithms (Boruta is based on Random Forest and XGBoost-we will use for training), whcih are **not sensitive** to feature scaling.
+
+
+```{r Training/Test split}
+
+# Subset & keep only non-missing failures
+df_subset = df %>%
+  select(Failure, all_of(numerical_data)) %>%
+  filter(!is.na(Failure)) %>% 
+  mutate(
+    Failure = factor(
+      Failure,
+      levels = c(0, 1),
+      labels = c("Success", "Failure")
+    )
+  )
+
+# Train/Test split 
+set.seed(45)
+train_idx = createDataPartition(df_subset$Failure, p = 0.7, list = FALSE)
+train_data = df_subset[train_idx, ]
+test_data = df_subset[-train_idx, ]
+
+cat("Training set distribution:\n")
+print(table(train_data$Failure))
+cat("\nTest set distribution:\n")
+print(table(test_data$Failure))
+```
+
+We can see again that our Success/Failure distribution is not balanced, we are going to account for that in learning.
+
+# **Part 7**: Feature Selection
+
+This chunk runs Boruta feature selection on the training set: it sets a seed for reproducibility, fits Boruta with a p‑value threshold of 0.05, applies TentativeRoughFix to resolve any uncertain features, and then extracts and retains only the confirmed and tentative attributes.
+
+```{r Feature Selection}
+set.seed(7)
+boruta_out=Boruta(Failure ~ ., data = train_data, pValue = 0.05, doTrace = 0)
+boruta_fixed= TentativeRoughFix(boruta_out)
+att_stats= attStats(boruta_fixed)
+att_stats$Feature= rownames(att_stats)
+att_stats=att_stats[att_stats$decision %in% c("Confirmed", "Tentative"), ]
+```
+---
+
+# **Part 8**: Feature Selection Plots
+
+This part first filters out the Boruta‑confirmed features and plots their mean importance in a horizontal bar chart. It then reshapes the training data into long format and, for each confirmed feature, creates (a) faceted boxplots showing the distribution by Failure status and (b) faceted bar charts of mean feature values by Failure.
+
+```{r Confirmed Features,fig.width=12, fig.height=8}
+confirmed = att_stats %>% filter(decision == "Confirmed")
+
+# Plot with ggplot2
+ggplot(confirmed, aes(x = reorder(Feature, meanImp), y = meanImp, fill = decision)) +
+  geom_col() +
+  coord_flip() +
+  labs(
+    title = "All Confirmed Features by Boruta Importance",
+    x = "Feature",
+    y = "Mean Importance",
+    fill = "Boruta Decision"
+  ) +
+  theme_minimal(base_size = 13)
+```
+**Figure 4. Mean Importance of Boruta‑Confirmed Features.** *The horizontal bar chart shows all Boruta‑confirmed features sorted by mean importance. Texture descriptors, especially gray‑level emphasis metrics (Energy Cluster), dominate the top ranks, alongside a smaller set of joint‑statistics and texture descriptors (texture descriptors clusters). This distribution mirrors earlier correlation analysis, which revealed three distinct feature clusters, each of which is represented among the confirmed predictors.*
+
+
+```{r Plot features,fig.width=14, fig.height=12}
+# Subset train to confirmed features
+train_conf=train_data %>% 
+  select(Failure, all_of(confirmed$Feature))
+test_conf = test_data %>% 
+  select(Failure, all_of(confirmed$Feature))
+# Long format
+train_long= train_conf %>%
+  pivot_longer(-Failure, names_to="Feature", values_to="Value")
+
+# a) Boxplots
+ggplot(train_long, aes(x=Failure, y=Value, fill=Failure)) +
+  geom_boxplot(outlier.size=0.8, alpha=0.7) +
+  facet_wrap(~Feature, scales="free", ncol=4) +
+  labs(
+    title = "Distribution of Confirmed Features by Failure",
+    x = "Failure", 
+    y = "Value"
+  ) +
+  theme_minimal(base_size=13) +
+  theme(legend.position="none")
+```
+**Figure 5. Distribution of Boruta‑Confirmed Features by Outcome.** *This faceted box‑plot compares the per‑class distributions of the Boruta‑confirmed predictors for “Success” (red) and “Failure” (teal). Nearly every feature (12/16) exhibits higher median and upper‑quantile values in the Failure group. The consistency of these shifts across all three previously identified feature clusters underscores, class‑specific signal captured by these variables. These distributional differences support their utility in supervised models and validate the earlier findings from our correlation and importance analyses.While the overall trends are clear, there is still noticeable overlap between the classes in several features, as indicated by the interlinked box plots. This suggests that although the features are informative, they may not be fully discriminative on their own.*
+
+```{r Plot features 2,fig.width=14, fig.height=12}
+# b) Mean value bar charts
+train_long %>%
+  group_by(Feature, Failure, .drop=TRUE) %>%
+  summarise(Mean=mean(Value, na.rm=TRUE), .groups="drop") %>%
+  ggplot(aes(x=Failure, y=Mean, fill=Failure)) +
+    geom_col(position="dodge") +
+    facet_wrap(~Feature, scales="free_y", ncol=4) +
+    labs(
+      title = "Mean Values of Confirmed Features by Failure",
+      x = "Failure",
+      y = "Mean Value"
+    ) +
+    theme_minimal(base_size=13) +
+    theme(legend.position="none")
+```
+**Figure 6. Mean Values of Boruta‑Confirmed Features by Outcome** *This panel of bar plots contrasts the average feature values for “Success” (red) and “Failure” (teal) across all Boruta‑confirmed predictors. Again we can see that in most of the cases(12/16), the absolute mean is substantially higher in the Failure group.*
+
+
+---
+
+# **Part 9**: XGBoost
+
+The following code chunks use the Boruta-confirmed features to create XGBoost DMatrix objects for both hyperparameter tuning and subsequent model training/testing. An XGBoost model is configured with a weighted binary logistic objective to address class imbalance. The optimal hyperparameters are identified through cross-validation. The model is then trained using early stopping based on log-loss. After training, predicted probabilities are generated on the test set. The optimal classification threshold is determined using Youden’s J statistic, and these probabilities are then converted into final binary class labels.
+
+## Hyperparameter Tuning
+
+```{r XGBoost_Full_Pipeline, warning=FALSE, message=FALSE}
+
+# 1. Ensure Failure is a factor with correct levels
+
+train_data = train_conf %>%
+  mutate(Failure = factor(Failure, levels = c("Success", "Failure")))
+test_data = test_conf %>%
+  mutate(Failure = factor(Failure, levels = c("Success", "Failure")))
+
+# 2. Clean up column names
+train_data = train_data %>% clean_names()
+test_data=test_data  %>% clean_names()
+
+# 3. Build classification tasks (mlr)
+traintask = makeClassifTask(data = train_data, target = "failure")
+testtask= makeClassifTask(data = test_data,  target = "failure")
+
+# 4. Encode all factor columns. Binary (0/1) column per level. One‑hot encoding
+traintask = createDummyFeatures(traintask, method = "1-of-n")
+testtask= createDummyFeatures(testtask,  method = "1-of-n")
+
+# 5. Extract back to data.frames
+train_df= getTaskData(traintask)
+test_df = getTaskData(testtask)
+
+# 6. Prepare X / y & DMatrix objects
+# Convert factor → integer codes {1,2} → minus 1 → {0,1}
+y_train= as.integer(train_df$failure) - 1L
+y_test= as.integer(test_df$failure)  - 1L
+
+X_train = train_df %>% select(-failure) %>% as.matrix()
+X_test=test_df  %>% select(-failure) %>% as.matrix()
+
+dtrain = xgb.DMatrix(data = X_train, label = y_train)
+dtest = xgb.DMatrix(data = X_test,  label = y_test)
+
+# 7. Define the learner with class‐balance + single‐thread to not cause over threading when tuning
+lrn = makeLearner("classif.xgboost", predict.type = "response")
+lrn$par.vals = list(
+  objective = "binary:logistic",
+  eval_metric = "error",
+  nrounds = 100L,                  
+  nthread = 1L,
+  scale_pos_weight = sum(y_train == 0) / sum(y_train == 1) # Weight balance, helps target both classes
+)
+
+# 8. Hyperparameter search space & tuning setup
+ps = makeParamSet(
+  makeDiscreteParam("booster",         values = c("gbtree","gblinear")),
+  makeIntegerParam ("max_depth",       lower  = 3L, upper = 10L),
+  makeNumericParam ("min_child_weight", lower = 1,   upper = 10),
+  makeNumericParam ("subsample",        lower = 0.5, upper = 1),
+  makeNumericParam ("colsample_bytree", lower = 0.5, upper = 1),
+  makeNumericParam ("eta",              lower = 0.1, upper = 1),
+  makeIntegerParam ("gamma",            lower = 0L,  upper = 10L)
+
+)
+
+
+rdesc = makeResampleDesc("CV", iters = 3L, stratify = TRUE)
+ctrl = makeTuneControlRandom(maxit = 100L)
+
+# 9. Parallel tuning
+parallelStartSocket(cpus = parallel::detectCores() - 1L)
+set.seed(7)
+mytune <- tuneParams(
+  learner    = lrn,
+  task       = traintask,
+  resampling = rdesc,
+  measures   = acc,
+  par.set    = ps,
+  control    = ctrl,
+  show.info  = TRUE
+)
+parallelStop()
+best_params= mytune$x
+best_acc = mytune$y
+# 10. Best parameters & performance
+cat("Best parameters:\n")
+print(best_params)  
+cat("\nBest accuracy:", best_acc, "\n")
+```
+
+
+## Model Training
+
+```{r Train with best par, warning=FALSE, message=FALSE}
+# 1. Pull in best hyperparameters 
+best_params = mytune$x
+scale_pos_weight = sum(y_train == 0) / sum(y_train == 1) # Weight balance, helps target both classes
+
+# 2. Assemble params + nrounds 
+xgb_params <- list(
+  objective        = "binary:logistic",
+  eval_metric      = "error", 
+  booster          = best_params$booster,
+  eta              = best_params$eta,
+  max_depth        = best_params$max_depth,
+  min_child_weight = best_params$min_child_weight,
+  subsample        = best_params$subsample,
+  colsample_bytree = best_params$colsample_bytree,
+  gamma            = best_params$gamma,
+  scale_pos_weight = scale_pos_weight
+)
+
+nrounds = lrn$par.vals$nrounds
+
+# 3. Train with early stopping 
+set.seed(7)
+watchlist = list(train = dtrain, test = dtest)
+
+xgb_final= xgb.train(
+  params                = xgb_params, # Some will through warning if gblinear was chosen
+  data                  = dtrain,
+  nrounds               = nrounds,
+  watchlist             = watchlist,
+  print_every_n         = 100,
+  early_stopping_rounds = 5000,
+  maximize              = FALSE
+)
+
+# 4. Predict
+# 4a. Probabilities
+probs = predict(xgb_final, dtest)
+# Compute ROC where "Success" is treated as the positive class
+# 4b. Compute ROC and Youden’s threshold
+roc_obj = roc(response = y_test, predictor = probs)
+coords_best = coords(
+  roc_obj,
+  x           = "best",
+  best.method = "youden",
+  ret         = c("threshold", "sensitivity", "specificity")
+)
+
+thr = as.numeric(coords_best[["threshold"]])
+cat("Youden’s best threshold:", thr, "\n\n")
+
+# 5c. Class predictions
+preds = factor(
+  ifelse(probs >= thr, "Failure", "Success"),
+  levels = c("Success","Failure")
+)
+truth = factor(
+  ifelse(y_test == 1, "Failure", "Success"),
+  levels = c("Success","Failure")
+)
+
+```
+
+# **Part 10**: Check Performance & Visuallize
+```{r Viz, figwidth=14, fig.height=6}
+
+cm = confusionMatrix(
+  data      = preds,
+  reference = truth,
+  positive  = "Failure"
+)
+print(cm)
+roc_obj <- roc(response = truth, predictor = probs)
+
+# Turn the 2×2 table into a data.frame
+cm_df=as.data.frame(cm$table)
+colnames(cm_df) = c("Actual", "Predicted", "Freq")
+
+# Build confusion‐matrix heatmap
+p_cm = ggplot(cm_df, aes(x = Actual, y = Predicted, fill = Freq)) +
+  geom_tile(color = "white", size = 1.2) +
+  geom_text(aes(label = Freq), size = 6) +
+  scale_fill_gradient(low = "#f2f2f2", high = "#2c3e50") +
+  labs(
+    title = "Confusion Matrix",
+    x     = "Actual Label",
+    y     = "Predicted Label"
+  ) +
+  theme_minimal(base_size = 15) +
+  theme(
+    legend.position    = "none",
+    plot.title         = element_text(hjust = 0.5, face = "bold")
+  )
+
+# Build ROC‐curve plot from the roc_obj slots
+roc_df=data.frame(
+  fpr = 1 - roc_obj$specificities,
+  tpr = roc_obj$sensitivities
+)
+p_roc=ggplot(roc_df, aes(x = fpr, y = tpr)) +
+  geom_line(size = 1.2) +
+  geom_abline(linetype = "dashed", color = "gray60") +
+  labs(
+    title = sprintf("ROC Curve (AUC = %.3f)", auc(roc_obj)),
+    x     = "False Positive Rate",
+    y     = "True Positive Rate"
+  ) +
+  theme_minimal(base_size = 15) +
+  theme(
+    plot.title = element_text(hjust = 0.5, face = "bold")
+  )
+
+# Side‐by‐side
+p_cm + p_roc + plot_layout(ncol = 2)
+```
+**Figure 5. Model Performance: Confusion Matrix and ROC Curve.** *The left panel presents the confusion matrix comparing predicted and actual class labels. The model shows high sensitivity for the ‘Success’ class. The right panel displays the ROC curve, with an AUC of 0.844, indicating strong overall discriminative ability. Despite the class imbalance, the model achieves good separation between classes*
+
+Overall, the model performs well. However, given the small dataset, these results should be interpreted with caution. More robust evaluation strategies, such as nested cross-validation with varying sampling schemes, would provide a more reliable estimate of model accuracy. That said, such complexity is beyond the scope of this exercise. As it stands, the model demonstrates good specificity and slightly lower, but acceptable, sensitivity.
+
+*Changing the random seed can lead to substantial variation in results, highlighting the sensitivity of the model to how the training and testing sets are split. This is likely due to the small dataset, where easily predictable and more challenging cases are not consistently represented across different seed-based splits.*
+
+```{r Predict NA,warning=FALSE}
+# 1. Subset original rows with missing Failure values
+new_data = df %>%
+  filter(is.na(Failure)) %>%
+  select(all_of(confirmed$Feature))  # Keep only important features
+
+new_data = new_data %>% clean_names()
+
+# 2. Ensure same transformations (one-hot encoding)
+new_data$failure = factor("Success", levels = c("Success", "Failure"))
+newtask = makeClassifTask(data = new_data, target = "failure")
+newtask = createDummyFeatures(newtask, method = "1-of-n")
+new_df = getTaskData(newtask) %>% select(-failure)
+
+# 3. Convert to matrix
+X_new = as.matrix(new_df)
+
+# 4. Predict with trained model
+dnew = xgb.DMatrix(data = X_new)
+new_probs = predict(xgb_final, dnew)
+
+# 5. Apply threshold
+new_preds = factor(
+  ifelse(new_probs >= thr, "Failure", "Success"),
+  levels = c("Success", "Failure")
+)
+cat("Predicted Labels for NA Rows:\n", as.character(new_preds), sep = "\n")
+```
+
+
+We observe that, although the initial clustering analysis suggested the NA cases were more similar to the "Success" group, the trained XGBoost model now predicts some of them as "Failure". This highlights the underlying complexity of the dataset and reinforces the idea that decision boundaries in this problem space are nuanced. It also emphasizes the value of supervised learning in capturing patterns that may not be evident through unsupervised techniques alone.
+
+# **Part 11**: Seed inconsistency (Extra)
+```{r STraining/Test split}
+
+# Subset & keep only non-missing failures
+df_subset = df %>%
+  select(Failure, all_of(numerical_data)) %>%
+  filter(!is.na(Failure)) %>% 
+  mutate(
+    Failure = factor(
+      Failure,
+      levels = c(0, 1),
+      labels = c("Success", "Failure")
+    )
+  )
+
+# Train/Test split 
+set.seed(1)
+train_idx = createDataPartition(df_subset$Failure, p = 0.7, list = FALSE)
+train_data = df_subset[train_idx, ]
+test_data = df_subset[-train_idx, ]
+
+cat("Training set distribution:\n")
+print(table(train_data$Failure))
+cat("\nTest set distribution:\n")
+print(table(test_data$Failure))
+```
+
+```{r SFeature Selection}
+boruta_out=Boruta(Failure ~ ., data = train_data, pValue = 0.05, doTrace = 0)
+boruta_fixed= TentativeRoughFix(boruta_out)
+att_stats= attStats(boruta_fixed)
+att_stats$Feature= rownames(att_stats)
+att_stats=att_stats[att_stats$decision %in% c("Confirmed", "Tentative"), ]
+```
+
+```{r SConfirmed Features,fig.width=12, fig.height=8}
+confirmed = att_stats %>% filter(decision == "Confirmed")
+
+# Plot with ggplot2
+ggplot(confirmed, aes(x = reorder(Feature, meanImp), y = meanImp, fill = decision)) +
+  geom_col() +
+  coord_flip() +
+  labs(
+    title = "All Confirmed Features by Boruta Importance",
+    x = "Feature",
+    y = "Mean Importance",
+    fill = "Boruta Decision"
+  ) +
+  theme_minimal(base_size = 13)
+```
+
+```{r SPlot features,fig.width=14, fig.height=12}
+# Subset train to confirmed features
+train_conf=train_data %>% 
+  select(Failure, all_of(confirmed$Feature))
+test_conf = test_data %>% 
+  select(Failure, all_of(confirmed$Feature))
+# Long format
+train_long= train_conf %>%
+  pivot_longer(-Failure, names_to="Feature", values_to="Value")
+
+# a) Boxplots
+ggplot(train_long, aes(x=Failure, y=Value, fill=Failure)) +
+  geom_boxplot(outlier.size=0.8, alpha=0.7) +
+  facet_wrap(~Feature, scales="free", ncol=4) +
+  labs(
+    title = "Distribution of Confirmed Features by Failure",
+    x = "Failure", 
+    y = "Value"
+  ) +
+  theme_minimal(base_size=13) +
+  theme(legend.position="none")
+```
+
+```{r SPlot features 2,fig.width=14, fig.height=12}
+# b) Mean value bar charts
+train_long %>%
+  group_by(Feature, Failure, .drop=TRUE) %>%
+  summarise(Mean=mean(Value, na.rm=TRUE), .groups="drop") %>%
+  ggplot(aes(x=Failure, y=Mean, fill=Failure)) +
+    geom_col(position="dodge") +
+    facet_wrap(~Feature, scales="free_y", ncol=4) +
+    labs(
+      title = "Mean Values of Confirmed Features by Failure",
+      x = "Failure",
+      y = "Mean Value"
+    ) +
+    theme_minimal(base_size=13) +
+    theme(legend.position="none")
+```
+
+## Hyperparameter Tuning
+
+```{r SXGBoost_Full_Pipeline, warning=FALSE, message=FALSE}
+
+# 1. Ensure Failure is a factor with correct levels
+
+train_data = train_conf %>%
+  mutate(Failure = factor(Failure, levels = c("Success", "Failure")))
+test_data = test_conf %>%
+  mutate(Failure = factor(Failure, levels = c("Success", "Failure")))
+
+# 2. Clean up column names
+train_data = train_data %>% clean_names()
+test_data=test_data  %>% clean_names()
+
+# 3. Build classification tasks (mlr)
+traintask = makeClassifTask(data = train_data, target = "failure")
+testtask= makeClassifTask(data = test_data,  target = "failure")
+
+# 4. Encode all factor columns. Binary (0/1) column per level. One‑hot encoding
+traintask = createDummyFeatures(traintask, method = "1-of-n")
+testtask= createDummyFeatures(testtask,  method = "1-of-n")
+
+# 5. Extract back to data.frames
+train_df= getTaskData(traintask)
+test_df = getTaskData(testtask)
+
+# 6. Prepare X / y & DMatrix objects
+# Convert factor → integer codes {1,2} → minus 1 → {0,1}
+y_train= as.integer(train_df$failure) - 1L
+y_test= as.integer(test_df$failure)  - 1L
+
+X_train = train_df %>% select(-failure) %>% as.matrix()
+X_test=test_df  %>% select(-failure) %>% as.matrix()
+
+dtrain = xgb.DMatrix(data = X_train, label = y_train)
+dtest = xgb.DMatrix(data = X_test,  label = y_test)
+
+# 7. Define the learner with class‐balance + single‐thread to not cause over threading when tuning
+lrn = makeLearner("classif.xgboost", predict.type = "response")
+lrn$par.vals = list(
+  objective = "binary:logistic",
+  eval_metric = "error",
+  nrounds = 100L,                  
+  nthread = 1L,
+  scale_pos_weight = sum(y_train == 0) / sum(y_train == 1) # Weight balance, helps target both classes
+)
+
+# 8. Hyperparameter search space & tuning setup
+ps = makeParamSet(
+  makeDiscreteParam("booster",         values = c("gbtree","gblinear")),
+  makeIntegerParam ("max_depth",       lower  = 3L, upper = 10L),
+  makeNumericParam ("min_child_weight", lower = 1,   upper = 10),
+  makeNumericParam ("subsample",        lower = 0.5, upper = 1),
+  makeNumericParam ("colsample_bytree", lower = 0.5, upper = 1),
+  makeNumericParam ("eta",              lower = 0.1, upper = 1),
+  makeIntegerParam ("gamma",            lower = 0L,  upper = 10L)
+
+)
+
+
+rdesc = makeResampleDesc("CV", iters = 3L, stratify = TRUE)
+ctrl = makeTuneControlRandom(maxit = 100L)
+
+# 9. Parallel tuning
+parallelStartSocket(cpus = parallel::detectCores() - 1L)
+mytune <- tuneParams(
+  learner    = lrn,
+  task       = traintask,
+  resampling = rdesc,
+  measures   = acc,
+  par.set    = ps,
+  control    = ctrl,
+  show.info  = TRUE
+)
+parallelStop()
+best_params= mytune$x
+best_acc = mytune$y
+# 10. Best parameters & performance
+cat("Best parameters:\n")
+print(best_params)  
+cat("\nBest accuracy:", best_acc, "\n")
+```
+
+
+## Model Training
+
+```{r STrain with best par, warning=FALSE, message=FALSE}
+# 1. Pull in best hyperparameters 
+best_params = mytune$x
+scale_pos_weight = sum(y_train == 0) / sum(y_train == 1) # Weight balance, helps target both classes
+
+# 2. Assemble params + nrounds 
+xgb_params <- list(
+  objective        = "binary:logistic",
+  eval_metric      = "error", 
+  booster          = best_params$booster,
+  eta              = best_params$eta,
+  max_depth        = best_params$max_depth,
+  min_child_weight = best_params$min_child_weight,
+  subsample        = best_params$subsample,
+  colsample_bytree = best_params$colsample_bytree,
+  gamma            = best_params$gamma,
+  scale_pos_weight = scale_pos_weight
+)
+
+nrounds = lrn$par.vals$nrounds
+
+# 3. Train with early stopping 
+watchlist = list(train = dtrain, test = dtest)
+
+xgb_final= xgb.train(
+  params                = xgb_params, # Some will through warning if gblinear was chosen
+  data                  = dtrain,
+  nrounds               = nrounds,
+  watchlist             = watchlist,
+  print_every_n         = 100,
+  early_stopping_rounds = 5000,
+  maximize              = FALSE
+)
+
+# 4. Predict
+# 4a. Probabilities
+probs = predict(xgb_final, dtest)
+# Compute ROC where "Success" is treated as the positive class
+# 4b. Compute ROC and Youden’s threshold
+roc_obj = roc(response = y_test, predictor = probs)
+coords_best = coords(
+  roc_obj,
+  x           = "best",
+  best.method = "youden",
+  ret         = c("threshold", "sensitivity", "specificity")
+)
+
+thr = as.numeric(coords_best[["threshold"]])
+cat("Youden’s best threshold:", thr, "\n\n")
+
+# 5c. Class predictions
+preds = factor(
+  ifelse(probs >= thr, "Failure", "Success"),
+  levels = c("Success","Failure")
+)
+truth = factor(
+  ifelse(y_test == 1, "Failure", "Success"),
+  levels = c("Success","Failure")
+)
+
+```
+
+```{r SViz, figwidth=14, fig.height=6}
+
+cm = confusionMatrix(
+  data      = preds,
+  reference = truth,
+  positive  = "Failure"
+)
+print(cm)
+roc_obj <- roc(response = truth, predictor = probs)
+
+# Turn the 2×2 table into a data.frame
+cm_df=as.data.frame(cm$table)
+colnames(cm_df) = c("Actual", "Predicted", "Freq")
+
+# Build confusion‐matrix heatmap
+p_cm = ggplot(cm_df, aes(x = Actual, y = Predicted, fill = Freq)) +
+  geom_tile(color = "white", size = 1.2) +
+  geom_text(aes(label = Freq), size = 6) +
+  scale_fill_gradient(low = "#f2f2f2", high = "#2c3e50") +
+  labs(
+    title = "Confusion Matrix",
+    x     = "Actual Label",
+    y     = "Predicted Label"
+  ) +
+  theme_minimal(base_size = 15) +
+  theme(
+    legend.position    = "none",
+    plot.title         = element_text(hjust = 0.5, face = "bold")
+  )
+
+# Build ROC‐curve plot from the roc_obj slots
+roc_df=data.frame(
+  fpr = 1 - roc_obj$specificities,
+  tpr = roc_obj$sensitivities
+)
+p_roc=ggplot(roc_df, aes(x = fpr, y = tpr)) +
+  geom_line(size = 1.2) +
+  geom_abline(linetype = "dashed", color = "gray60") +
+  labs(
+    title = sprintf("ROC Curve (AUC = %.3f)", auc(roc_obj)),
+    x     = "False Positive Rate",
+    y     = "True Positive Rate"
+  ) +
+  theme_minimal(base_size = 15) +
+  theme(
+    plot.title = element_text(hjust = 0.5, face = "bold")
+  )
+
+# Side‐by‐side
+p_cm + p_roc + plot_layout(ncol = 2)
+```
+```{r SPredict NA,warning=FALSE}
+# 1. Subset original rows with missing Failure values
+new_data = df %>%
+  filter(is.na(Failure)) %>%
+  select(all_of(confirmed$Feature))  # Keep only important features
+
+new_data = new_data %>% clean_names()
+
+# 2. Ensure same transformations (one-hot encoding)
+new_data$failure = factor("Success", levels = c("Success", "Failure"))
+newtask = makeClassifTask(data = new_data, target = "failure")
+newtask = createDummyFeatures(newtask, method = "1-of-n")
+new_df = getTaskData(newtask) %>% select(-failure)
+
+# 3. Convert to matrix
+X_new = as.matrix(new_df)
+
+# 4. Predict with trained model
+dnew = xgb.DMatrix(data = X_new)
+new_probs = predict(xgb_final, dnew)
+
+# 5. Apply threshold
+new_preds = factor(
+  ifelse(new_probs >= thr, "Failure", "Success"),
+  levels = c("Success", "Failure")
+)
+cat("Predicted Labels for NA Rows:\n", as.character(new_preds), sep = "\n")
+```
+We can see that simply changing the seed of the pipeline results in a substantial shift in model performance (Accuracy,AUC), with the previously mixed NA predictions now all classified as "Success". This variability strongly suggests that our dataset is both too small and too diverse for a single train/test split to yield stable or reliable conclusions. It underscores the need for more robust validation techniques (such as nested cross-validation) to better capture the full distribution of patterns in the data.
